@@ -122,28 +122,87 @@ def local_response_norm(x):
     return tf.nn.lrn(x, depth_radius=5, bias=2, alpha=1e-4, beta=0.75)
 
 
-def batch_norm(x, n_out, phase_train, scope='bn', decay=0.9, eps=1e-5, stddev=0.02):
-    """
-    Code taken from http://stackoverflow.com/a/34634291/2267819
-    """
-    with tf.variable_scope(scope):
-        beta = tf.get_variable(name='beta', shape=[n_out], initializer=tf.constant_initializer(0.0)
-                               , trainable=True)
-        gamma = tf.get_variable(name='gamma', shape=[n_out], initializer=tf.random_normal_initializer(1.0, stddev),
-                                trainable=True)
-        batch_mean, batch_var = tf.nn.moments(x, [0, 1, 2], name='moments')
-        ema = tf.train.ExponentialMovingAverage(decay=decay)
+def batch_norm(name, inputs, trainable, data_format, mode,
+               use_gamma=True, use_beta=True, bn_epsilon=1e-5, bn_ema=0.9, float_type=tf.float32):
+    # This is a rapid version of batch normalization but it does not suit well for multiple gpus.
+    # When trainable and not training mode, statistics will be frozen and parameters can be trained.
 
-        def mean_var_with_update():
-            ema_apply_op = ema.apply([batch_mean, batch_var])
-            with tf.control_dependencies([ema_apply_op]):
-                return tf.identity(batch_mean), tf.identity(batch_var)
+    def get_bn_variables(n_out, use_scale, use_bias, trainable, float_type):
+        # TODO: not sure what to do.
+        float_type = tf.float32
 
-        mean, var = tf.cond(phase_train,
-                            mean_var_with_update,
-                            lambda: (ema.average(batch_mean), ema.average(batch_var)))
-        normed = tf.nn.batch_normalization(x, mean, var, beta, gamma, eps)
-    return normed
+        if use_bias:
+            beta = tf.get_variable('beta', [n_out],
+                                   initializer=tf.constant_initializer(), trainable=trainable, dtype=float_type)
+        else:
+            beta = tf.zeros([n_out], name='beta')
+        if use_scale:
+            gamma = tf.get_variable('gamma', [n_out],
+                                    initializer=tf.constant_initializer(1.0), trainable=trainable, dtype=float_type)
+        else:
+            gamma = tf.ones([n_out], name='gamma')
+        # x * gamma + beta
+
+        moving_mean = tf.get_variable('moving_mean', [n_out],
+                                      initializer=tf.constant_initializer(), trainable=False, dtype=float_type)
+        moving_var = tf.get_variable('moving_variance', [n_out],
+                                     initializer=tf.constant_initializer(1), trainable=False, dtype=float_type)
+        return beta, gamma, moving_mean, moving_var
+
+    def update_bn_ema(xn, batch_mean, batch_var, moving_mean, moving_var, decay):
+        from tensorflow.contrib.framework import add_model_variable
+        from tensorflow.python.training import moving_averages
+        # TODO is there a way to use zero_debias in multi-GPU?
+        update_op1 = moving_averages.assign_moving_average(
+            moving_mean, batch_mean, decay, zero_debias=False,
+            name='mean_ema_op')
+        update_op2 = moving_averages.assign_moving_average(
+            moving_var, batch_var, decay, zero_debias=False,
+            name='var_ema_op')
+        add_model_variable(moving_mean)
+        add_model_variable(moving_var)
+
+        # seems faster than delayed update, but might behave otherwise in distributed settings.
+        with tf.control_dependencies([update_op1, update_op2]):
+            return tf.identity(xn, name='output')
+
+    # ======================== Checking valid values =========================
+    if data_format not in ['NHWC', 'NCHW']:
+        raise TypeError(
+            "Only two data formats are supported at this moment: 'NHWC' or 'NCHW', "
+            "%s is an unknown data format." % data_format)
+    assert inputs.get_shape().ndims == 4, 'inputs should have rank 4.'
+    assert inputs.dtype == float_type, 'inputs data type is different from %s' % float_type
+    if mode not in ['train', 'training', 'val', 'validation', 'test', 'eval']:
+        raise TypeError("Unknown mode.")
+
+    # ======================== Setting default values =========================
+    shape = inputs.get_shape().as_list()
+    assert len(shape) in [2, 4]
+    n_out = shape[-1]
+    if data_format == 'NCHW':
+        n_out = shape[1]
+    if mode is 'training' or mode is 'train':
+        mode = 'train'
+    else:
+        mode = 'test'
+
+    # ======================== Main operations =============================
+    with tf.variable_scope(name):
+        beta, gamma, moving_mean, moving_var = get_bn_variables(n_out, use_gamma, use_beta, trainable, float_type)
+
+        if mode == 'train' and trainable:
+            xn, batch_mean, batch_var = tf.nn.fused_batch_norm(
+                inputs, gamma, beta, epsilon=bn_epsilon,
+                is_training=True, data_format=data_format)
+            if tf.get_variable_scope().reuse:
+                return xn
+            else:
+                return update_bn_ema(xn, batch_mean, batch_var, moving_mean, moving_var, bn_ema)
+        else:
+            xn = tf.nn.batch_normalization(
+                inputs, moving_mean, moving_var, beta, gamma, bn_epsilon)
+            return xn
 
 
 def process_image(image, mean_pixel, norm):
@@ -156,18 +215,18 @@ def unprocess_image(image, mean_pixel, norm):
 
 def add_to_regularization_and_summary(var):
     if var is not None:
-        tf.histogram_summary(var.op.name, var)
+        tf.summary.histogram(var.op.name, var)
         tf.add_to_collection("reg_loss", tf.nn.l2_loss(var))
 
 
 def add_activation_summary(var):
-    tf.histogram_summary(var.op.name + "/activation", var)
-    tf.scalar_summary(var.op.name + "/sparsity", tf.nn.zero_fraction(var))
+    tf.summary.histogram(var.op.name + "/activation", var)
+    tf.summary.scalar(var.op.name + "/sparsity", tf.nn.zero_fraction(var))
 
 
 def add_gradient_summary(grad, var):
     if grad is not None:
-        tf.histogram_summary(var.op.name + "/gradient", grad)
+        tf.summary.histogram(var.op.name + "/gradient", grad)
 
 def save_imshow_grid(images, logs_dir, filename, shape):
     """

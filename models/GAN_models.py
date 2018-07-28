@@ -72,7 +72,8 @@ class GAN(object):
             b_z = utils.bias_variable([dims[0] * image_size * image_size], name="b_z")
             h_z = tf.matmul(z, W_z) + b_z
             h_z = tf.reshape(h_z, [-1, image_size, image_size, dims[0]])
-            h_bnz = utils.batch_norm(h_z, dims[0], train_phase, scope="gen_bnz")
+            # h_bnz = utils.batch_norm(h_z, dims[0], train_phase, scope="gen_bnz")
+            h_bnz = utils.batch_norm('gen_bnz', h_z, True, 'NHWC', train_phase)
             h = activation(h_bnz, name='h_z')
             utils.add_activation_summary(h)
 
@@ -80,16 +81,17 @@ class GAN(object):
                 image_size *= 2
                 W = utils.weight_variable([5, 5, dims[index + 1], dims[index]], name="W_%d" % index)
                 b = utils.bias_variable([dims[index + 1]], name="b_%d" % index)
-                deconv_shape = tf.pack([tf.shape(h)[0], image_size, image_size, dims[index + 1]])
+                deconv_shape = tf.stack([tf.shape(h)[0], image_size, image_size, dims[index + 1]])
                 h_conv_t = utils.conv2d_transpose_strided(h, W, b, output_shape=deconv_shape)
-                h_bn = utils.batch_norm(h_conv_t, dims[index + 1], train_phase, scope="gen_bn%d" % index)
+                # h_bn = utils.batch_norm(h_conv_t, dims[index + 1], train_phase, scope="gen_bn%d" % index)
+                h_bn = utils.batch_norm("gen_bn%d" % index, h_conv_t, True, 'NHWC', train_phase)
                 h = activation(h_bn, name='h_%d' % index)
                 utils.add_activation_summary(h)
 
             image_size *= 2
             W_pred = utils.weight_variable([5, 5, dims[-1], dims[-2]], name="W_pred")
             b_pred = utils.bias_variable([dims[-1]], name="b_pred")
-            deconv_shape = tf.pack([tf.shape(h)[0], image_size, image_size, dims[-1]])
+            deconv_shape = tf.stack([tf.shape(h)[0], image_size, image_size, dims[-1]])
             h_conv_t = utils.conv2d_transpose_strided(h, W_pred, b_pred, output_shape=deconv_shape)
             pred_image = tf.nn.tanh(h_conv_t, name='pred_image')
             utils.add_activation_summary(pred_image)
@@ -112,7 +114,12 @@ class GAN(object):
                     h_bn = h_conv
                     skip_bn = False
                 else:
-                    h_bn = utils.batch_norm(h_conv, dims[index + 1], train_phase, scope="disc_bn%d" % index)
+                    # from tensorflow.contrib.layers import batch_norm
+                    # h_bn = tf.contrib.layers.batch_norm(inputs=h_conv, decay=0.9, epsilon=1e-5, is_training=train_phase,
+                    #                                     scope="disc_bn%d" % index)
+                    # h_bn = utils.batch_norm(h_conv, dims[index + 1], train_phase, scope="disc_bn%d" % index)
+                    h_bn = utils.batch_norm("disc_bn%d" % index, h_conv, True, 'NHWC', train_phase,
+                                            bn_epsilon=1e-5, bn_ema=0.9)
                 h = activation(h_bn, name="h_%d" % index)
                 utils.add_activation_summary(h)
 
@@ -127,7 +134,7 @@ class GAN(object):
 
     def _cross_entropy_loss(self, logits, labels, name="x_entropy"):
         xentropy = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits, labels))
-        tf.scalar_summary(name, xentropy)
+        tf.summary.scalar(name, xentropy)
         return xentropy
 
     def _get_optimizer(self, optimizer_name, learning_rate, optimizer_param):
@@ -146,7 +153,7 @@ class GAN(object):
         return optimizer.apply_gradients(grads)
 
     def _setup_placeholder(self):
-        self.train_phase = tf.placeholder(tf.bool)
+        self.train_phase = 'train'
         self.z_vec = tf.placeholder(tf.float32, [self.batch_size, self.z_dim], name="z")
 
     def _gan_loss(self, logits_real, logits_fake, feature_real, feature_fake, use_features=False):
@@ -164,18 +171,18 @@ class GAN(object):
             gen_loss_features = 0
         self.gen_loss = gen_loss_disc + 0.1 * gen_loss_features
 
-        tf.scalar_summary("Discriminator_loss", self.discriminator_loss)
-        tf.scalar_summary("Generator_loss", self.gen_loss)
+        tf.summary.scalar("Discriminator_loss", self.discriminator_loss)
+        tf.summary.scalar("Generator_loss", self.gen_loss)
 
     def create_network(self, generator_dims, discriminator_dims, optimizer="Adam", learning_rate=2e-4,
                        optimizer_param=0.9, improved_gan_loss=True):
         print("Setting up model...")
         self._setup_placeholder()
-        tf.histogram_summary("z", self.z_vec)
+        tf.summary.histogram("z", self.z_vec)
         self.gen_images = self._generator(self.z_vec, generator_dims, self.train_phase, scope_name="generator")
 
-        tf.image_summary("image_real", self.images, max_images=2)
-        tf.image_summary("image_generated", self.gen_images, max_images=2)
+        tf.summary.image("image_real", self.images, max_outputs=2)
+        tf.summary.image("image_generated", self.gen_images, max_outputs=2)
 
         def leaky_relu(x, name="leaky_relu"):
             return utils.leaky_relu(x, alpha=0.2, name=name)
@@ -218,11 +225,11 @@ class GAN(object):
         print("Initializing network...")
         self.logs_dir = logs_dir
         self.sess = tf.Session()
-        self.summary_op = tf.merge_all_summaries()
+        self.summary_op = tf.summary.merge_all()
         self.saver = tf.train.Saver()
-        self.summary_writer = tf.train.SummaryWriter(self.logs_dir, self.sess.graph)
+        self.summary_writer = tf.summary.FileWriter(self.logs_dir, self.sess.graph)
 
-        self.sess.run(tf.initialize_all_variables())
+        self.sess.run(tf.global_variables_initializer())
         ckpt = tf.train.get_checkpoint_state(self.logs_dir)
         if ckpt and ckpt.model_checkpoint_path:
             self.saver.restore(self.sess, ckpt.model_checkpoint_path)
@@ -235,7 +242,8 @@ class GAN(object):
             print("Training model...")
             for itr in xrange(1, max_iterations):
                 batch_z = np.random.uniform(-1.0, 1.0, size=[self.batch_size, self.z_dim]).astype(np.float32)
-                feed_dict = {self.z_vec: batch_z, self.train_phase: True}
+                feed_dict = {self.z_vec: batch_z}
+                self.train_phase = 'train'
 
                 self.sess.run(self.discriminator_train_op, feed_dict=feed_dict)
                 self.sess.run(self.generator_train_op, feed_dict=feed_dict)
@@ -260,7 +268,8 @@ class GAN(object):
     def visualize_model(self):
         print("Sampling images from model...")
         batch_z = np.random.uniform(-1.0, 1.0, size=[self.batch_size, self.z_dim]).astype(np.float32)
-        feed_dict = {self.z_vec: batch_z, self.train_phase: False}
+        feed_dict = {self.z_vec: batch_z}
+        self.train_phase = 'val'
 
         images = self.sess.run(self.gen_images, feed_dict=feed_dict)
         images = utils.unprocess_image(images, 127.5, 127.5).astype(np.uint8)
@@ -282,7 +291,10 @@ class WasserstienGAN(GAN):
             W_z = utils.weight_variable([self.z_dim, dims[0] * image_size * image_size], name="W_z")
             h_z = tf.matmul(z, W_z)
             h_z = tf.reshape(h_z, [-1, image_size, image_size, dims[0]])
-            h_bnz = utils.batch_norm(h_z, dims[0], train_phase, scope="gen_bnz")
+            # h_bnz = tf.contrib.layers.batch_norm(inputs=h_z, decay=0.9, epsilon=1e-5, is_training=train_phase,
+            #                                      scope="gen_bnz")
+            # h_bnz = utils.batch_norm(h_z, dims[0], train_phase, scope="gen_bnz")
+            h_bnz = utils.batch_norm('gen_bnz', h_z, True, 'NHWC', train_phase)
             h = activation(h_bnz, name='h_z')
             utils.add_activation_summary(h)
 
@@ -290,16 +302,19 @@ class WasserstienGAN(GAN):
                 image_size *= 2
                 W = utils.weight_variable([4, 4, dims[index + 1], dims[index]], name="W_%d" % index)
                 b = tf.zeros([dims[index + 1]])
-                deconv_shape = tf.pack([tf.shape(h)[0], image_size, image_size, dims[index + 1]])
+                deconv_shape = tf.stack([tf.shape(h)[0], image_size, image_size, dims[index + 1]])
                 h_conv_t = utils.conv2d_transpose_strided(h, W, b, output_shape=deconv_shape)
-                h_bn = utils.batch_norm(h_conv_t, dims[index + 1], train_phase, scope="gen_bn%d" % index)
+                # h_bn = tf.contrib.layers.batch_norm(inputs=h_conv_t, decay=0.9, epsilon=1e-5, is_training=train_phase,
+                #                                     scope="gen_bn%d" % index)
+                # h_bn = utils.batch_norm(h_conv_t, dims[index + 1], train_phase, scope="gen_bn%d" % index)
+                h_bn = utils.batch_norm("gen_bn%d" % index, h_conv_t, True, 'NHWC', train_phase)
                 h = activation(h_bn, name='h_%d' % index)
                 utils.add_activation_summary(h)
 
             image_size *= 2
             W_pred = utils.weight_variable([4, 4, dims[-1], dims[-2]], name="W_pred")
             b = tf.zeros([dims[-1]])
-            deconv_shape = tf.pack([tf.shape(h)[0], image_size, image_size, dims[-1]])
+            deconv_shape = tf.stack([tf.shape(h)[0], image_size, image_size, dims[-1]])
             h_conv_t = utils.conv2d_transpose_strided(h, W_pred, b, output_shape=deconv_shape)
             pred_image = tf.nn.tanh(h_conv_t, name='pred_image')
             utils.add_activation_summary(pred_image)
@@ -322,7 +337,11 @@ class WasserstienGAN(GAN):
                     h_bn = h_conv
                     skip_bn = False
                 else:
-                    h_bn = utils.batch_norm(h_conv, dims[index + 1], train_phase, scope="disc_bn%d" % index)
+                    # h_bn = tf.contrib.layers.batch_norm(inputs=h_conv, decay=0.9, epsilon=1e-5, is_training=train_phase,
+                    #                                     scope="disc_bn%d" % index)
+                    h_bn = utils.batch_norm("disc_bn%d" % index, h_conv, True, 'NHWC', train_phase,
+                                            bn_epsilon=1e-5, bn_ema=0.9)
+                    # h_bn = utils.batch_norm(h_conv, dims[index + 1], train_phase, scope="disc_bn%d" % index)
                 h = activation(h_bn, name="h_%d" % index)
                 utils.add_activation_summary(h)
 
@@ -335,8 +354,8 @@ class WasserstienGAN(GAN):
         self.discriminator_loss = tf.reduce_mean(logits_real - logits_fake)
         self.gen_loss = tf.reduce_mean(logits_fake)
 
-        tf.scalar_summary("Discriminator_loss", self.discriminator_loss)
-        tf.scalar_summary("Generator_loss", self.gen_loss)
+        tf.summary.scalar("Discriminator_loss", self.discriminator_loss)
+        tf.summary.scalar("Generator_loss", self.gen_loss)
 
     def train_model(self, max_iterations):
         try:
@@ -348,7 +367,7 @@ class WasserstienGAN(GAN):
 
             def get_feed_dict(train_phase=True):
                 batch_z = np.random.uniform(-1.0, 1.0, size=[self.batch_size, self.z_dim]).astype(np.float32)
-                feed_dict = {self.z_vec: batch_z, self.train_phase: train_phase}
+                feed_dict = {self.z_vec: batch_z}
                 return feed_dict
 
             for itr in xrange(1, max_iterations):
